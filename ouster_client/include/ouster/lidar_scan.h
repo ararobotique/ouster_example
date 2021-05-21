@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "ouster/types.h"
+// #include <ros/ros.h>
 
 namespace ouster {
 
@@ -29,6 +30,7 @@ namespace ouster {
 class LidarScan {
    public:
     static constexpr int N_FIELDS = 4;
+    size_t measure_id; 
 
     using raw_t = uint32_t;
     using ts_t = std::chrono::nanoseconds;
@@ -184,6 +186,15 @@ inline XYZLut make_xyz_lut(const sensor::sensor_info& sensor) {
         sensor.beam_altitude_angles);
 }
 
+
+XYZLut make_xyz_lut(size_t w, size_t h, double range_unit,
+                    double lidar_origin_to_beam_origin_mm,
+                    const mat4d& transform,
+                    const std::vector<double>& azimuth_angles_deg,
+                    const std::vector<double>& altitude_angles_deg,
+                    size_t measure_id, 
+                    size_t W_total);
+
 /**
  * Convert LidarScan to cartesian points.
  *
@@ -257,7 +268,7 @@ class ScanBatcher {
     std::ptrdiff_t h;
     uint16_t next_m_id;
     LidarScan ls_write;
-
+    LidarScan ls_write_sub;
    public:
     sensor::packet_format pf;
 
@@ -277,6 +288,16 @@ class ScanBatcher {
      * @return true when the provided lidar scan is ready to use
      */
     bool operator()(const uint8_t* packet_buf, LidarScan& ls);
+
+    /**
+     * Split packet into chuncks, 30 degree per chunck.
+     *
+     * @param packet_buf the lidar packet
+     * @param lidar scan to populate
+     * @param lidar_pub publish sub cloud.
+     * @return true when the provided lidar scan is ready to use
+     */
+    bool operator()(const uint8_t* packet_buf, LidarScan& ls, bool is_sub);
 };
 
 }  // namespace ouster

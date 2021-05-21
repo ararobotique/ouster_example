@@ -69,6 +69,7 @@ void scan_to_cloud(const ouster::XYZLut& xyz_lut,
                    ouster_ros::Cloud& cloud) {
     cloud.resize(ls.w * ls.h);
     auto points = ouster::cartesian(ls, xyz_lut);
+    
 
     for (auto u = 0; u < ls.h; u++) {
         for (auto v = 0; v < ls.w; v++) {

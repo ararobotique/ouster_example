@@ -3,10 +3,63 @@
 #include <Eigen/Eigen>
 #include <cmath>
 #include <vector>
+#include <iostream>
 
 namespace ouster {
 
-constexpr int LidarScan::N_FIELDS;
+constexpr int LidarScan::N_FIELDS;//4
+
+XYZLut make_xyz_lut(size_t w, size_t h, double range_unit,
+                    double lidar_origin_to_beam_origin_mm,
+                    const mat4d& transform,
+                    const std::vector<double>& azimuth_angles_deg,
+                    const std::vector<double>& altitude_angles_deg,
+                    size_t measure_id,
+                    size_t W_total) {
+    Eigen::ArrayXd encoder(w * h);   // theta_e
+    Eigen::ArrayXd azimuth(w * h);   // theta_a
+    Eigen::ArrayXd altitude(w * h);  // phi
+
+    const double azimuth_radians = M_PI * 2.0 / W_total;
+
+
+    // populate angles for each pixel
+    for (size_t v = measure_id; v < measure_id + 16; v++) {
+        for (size_t u = 0; u < h; u++) {
+            size_t i = u * w + v - measure_id;
+            encoder(i) = 2 * M_PI - (v * azimuth_radians);
+            azimuth(i) = -azimuth_angles_deg[u] * M_PI / 180.0;
+            altitude(i) = altitude_angles_deg[u] * M_PI / 180.0;
+        }
+    }
+
+    XYZLut lut;
+
+    // unit vectors for each pixel
+    lut.direction = LidarScan::Points{w * h, 3};
+    lut.direction.col(0) = (encoder + azimuth).cos() * altitude.cos();
+    lut.direction.col(1) = (encoder + azimuth).sin() * altitude.cos();
+    lut.direction.col(2) = altitude.sin();
+
+    // offsets due to beam origin
+    lut.offset = LidarScan::Points{w * h, 3};
+    lut.offset.col(0) = encoder.cos() - lut.direction.col(0);
+    lut.offset.col(1) = encoder.sin() - lut.direction.col(1);
+    lut.offset.col(2) = -lut.direction.col(2);
+    lut.offset *= lidar_origin_to_beam_origin_mm;
+
+    // apply the supplied transform
+    auto rot = transform.topLeftCorner(3, 3).transpose();
+    auto trans = transform.topRightCorner(3, 1).transpose();
+    lut.direction.matrix() *= rot;
+    lut.offset.matrix() += trans.replicate(w * h, 1);
+
+    // apply scaling factor
+    lut.direction *= range_unit;
+    lut.offset *= range_unit;
+
+    return lut;
+}
 
 XYZLut make_xyz_lut(size_t w, size_t h, double range_unit,
                     double lidar_origin_to_beam_origin_mm,
@@ -65,8 +118,78 @@ LidarScan::Points cartesian(const LidarScan& scan, const XYZLut& lut) {
 }
 
 ScanBatcher::ScanBatcher(size_t w, const sensor::packet_format& pf)
-    : w(w), h(pf.pixels_per_column), next_m_id(0), ls_write(w, h), pf(pf) {}
+    : w(w), h(pf.pixels_per_column), next_m_id(0), ls_write(w, h), ls_write_sub(w, h), pf(pf) {
+        ls_write_sub.frame_id = 0; 
+    }
 
+//for sub clouds
+bool ScanBatcher::operator()(const uint8_t* packet_buf, LidarScan& ls_sub, bool is_sub) {
+
+    using row_view_t_sub =
+        Eigen::Map<Eigen::Array<LidarScan::raw_t, Eigen::Dynamic,
+                                Eigen::Dynamic, Eigen::RowMajor>>;
+
+    if (ls_sub.w != w || ls_sub.h != h || !is_sub)
+        throw std::invalid_argument("unexpected scan dimensions");
+
+    bool swapped_sub = false;
+    uint16_t max_m_id; 
+
+    for (int icol = 0; icol < pf.columns_per_packet; icol++) {
+        
+        const uint8_t* col_buf = pf.nth_col(icol, packet_buf);
+        const std::chrono::nanoseconds ts(pf.col_timestamp(col_buf));
+        const uint32_t encoder = pf.col_encoder(col_buf);
+        const uint32_t status = pf.col_status(col_buf);
+        const bool valid = (status == 0xffffffff);
+        const uint16_t m_id = pf.col_measurement_id(col_buf);
+        max_m_id = m_id + 1;
+        ls_write_sub.measure_id = max_m_id - pf.columns_per_packet;  
+
+        // drop invalid / out-of-bounds data in case of misconfiguration
+        if (!valid ) {
+            // zero out missing columns
+            ls_write_sub.header(icol) = {ts, encoder, status};
+            auto rows = h * LidarScan::N_FIELDS;
+            row_view_t_sub{ls_write_sub.data.data(), rows, w}
+                .block(0, icol, rows,1)
+                .setZero();
+            continue;
+        }
+
+        // if(is_sub && icol == 0){
+        //     auto rows = h * LidarScan::N_FIELDS;
+        //     row_view_t_sub{ls_write_sub.data.data(), rows, w}
+        //             .block(0, 0, rows, m_id)
+        //             .setZero();
+        // }
+
+        ls_write_sub.header(icol) = {ts, encoder, status};
+        for (uint8_t ipx = 0; ipx < h; ipx++){
+            const uint8_t* px_buf = pf.nth_px(ipx, col_buf);
+
+            ls_write_sub.block(icol).row(ipx)
+                << static_cast<LidarScan::raw_t>(pf.px_range(px_buf)),
+                static_cast<LidarScan::raw_t>(pf.px_signal(px_buf)),
+                static_cast<LidarScan::raw_t>(pf.px_ambient(px_buf)),
+                static_cast<LidarScan::raw_t>(pf.px_reflectivity(px_buf));
+        }
+    }
+
+    // auto rows = h * LidarScan::N_FIELDS;
+    
+    // row_view_t_sub{ls_write_sub.data.data(), rows, w}
+    //         .block(0, max_m_id, rows, w - max_m_id)
+    //         .setZero();
+    std::swap(ls_sub, ls_write_sub); 
+    swapped_sub = true; 
+    ls_write_sub.frame_id += 1; 
+    return swapped_sub;
+}
+
+
+
+// for point clouds 
 bool ScanBatcher::operator()(const uint8_t* packet_buf, LidarScan& ls) {
     using row_view_t =
         Eigen::Map<Eigen::Array<LidarScan::raw_t, Eigen::Dynamic,
@@ -79,15 +202,18 @@ bool ScanBatcher::operator()(const uint8_t* packet_buf, LidarScan& ls) {
 
     for (int icol = 0; icol < pf.columns_per_packet; icol++) {
         const uint8_t* col_buf = pf.nth_col(icol, packet_buf);
-        const uint16_t m_id = pf.col_measurement_id(col_buf);
-        const uint16_t f_id = pf.col_frame_id(col_buf);
-        const std::chrono::nanoseconds ts(pf.col_timestamp(col_buf));
+        const uint16_t m_id = pf.col_measurement_id(col_buf);//8
+        const uint16_t f_id = pf.col_frame_id(col_buf);//10
+        const std::chrono::nanoseconds ts(pf.col_timestamp(col_buf));//0
         const uint32_t encoder = pf.col_encoder(col_buf);
         const uint32_t status = pf.col_status(col_buf);
         const bool valid = (status == 0xffffffff);
 
         // drop invalid / out-of-bounds data in case of misconfiguration
-        if (!valid || m_id >= w || f_id + 1 == ls_write.frame_id) continue;
+        if (!valid || m_id >= w || f_id + 1 == ls_write.frame_id) {
+            
+            continue;
+        }
 
         if (ls_write.frame_id != f_id) {
             // if not initializing with first packet
@@ -130,5 +256,6 @@ bool ScanBatcher::operator()(const uint8_t* packet_buf, LidarScan& ls) {
     }
     return swapped;
 }
+
 
 }  // namespace ouster
